@@ -2,79 +2,138 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// API URLs
-const apiLoginUrl = "https://api.jadoodigital.com/api/v2.1/user/auth/login";
-const apiRefreshUrl = "https://api.jadoodigital.com/api/v2.1/user/auth/refresh";
-const tokenFile = path.join(__dirname, "token.cache");
+// Jadoo API Configuration
+const API_LOGIN_URL = "https://api.jadoodigital.com/api/v2.1/user/auth/login";
+const API_REFRESH_URL = "https://api.jadoodigital.com/api/v2.1/user/auth/refresh";
+const API_CHANNEL_URL = "https://api.jadoodigital.com/api/v2.1/user/channel/";
 
-// Login Credentials
-const username = "jadoo6000";
-const password = "jadoo6000";
-const domain = "af1dd86c3fb8448e87bb7770000c930c";
+const USERNAME = process.env.JADOO_USERNAME || "jadoo6000";
+const PASSWORD = process.env.JADOO_PASSWORD || "jadoo6000";
+const DOMAIN = process.env.JADOO_DOMAIN || "af1dd86c3fb8448e87bb7770000c930c";
 
-// Function: Save Token
-const saveToken = (token) => fs.writeFileSync(tokenFile, token);
-const getToken = () => fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, "utf8") : null;
+// Token Cache
+const TOKEN_CACHE = path.join(__dirname, "token.json");
 
-// Function: Login & Get Refresh Token
-async function login() {
-    try {
-        const response = await axios.post(apiLoginUrl, { username, password, domain });
-        if (response.data?.data?.refresh_token) {
-            saveToken(response.data.data.refresh_token);
-            return response.data.data.refresh_token;
-        }
-    } catch (error) {
-        console.error("Login Failed:", error.response?.data || error.message);
+// Save Token
+const saveToken = (tokenData) => {
+    fs.writeFileSync(TOKEN_CACHE, JSON.stringify(tokenData));
+};
+
+// Read Token
+const readToken = () => {
+    if (fs.existsSync(TOKEN_CACHE)) {
+        return JSON.parse(fs.readFileSync(TOKEN_CACHE, "utf8"));
     }
     return null;
-}
+};
 
-// Function: Get Access Token
-async function getAccessToken() {
-    let refreshToken = getToken();
-    if (!refreshToken) refreshToken = await login();
+// Get Refresh Token
+const getRefreshToken = async () => {
+    try {
+        const response = await axios.post(API_LOGIN_URL, {
+            username: USERNAME,
+            password: PASSWORD,
+            domain: DOMAIN,
+        }, { headers: { "Content-Type": "application/json" } });
+
+        if (response.data.data?.refresh_token) {
+            saveToken({ refreshToken: response.data.data.refresh_token });
+            return response.data.data.refresh_token;
+        } else {
+            throw new Error("Refresh Token Not Found!");
+        }
+    } catch (error) {
+        console.error("❌ Jadoo Login Failed!", error.response ? error.response.data : error.message);
+        return null;
+    }
+};
+
+// Get Access Token
+const getAccessToken = async () => {
+    let tokenData = readToken();
+    let refreshToken = tokenData?.refreshToken || await getRefreshToken();
+
     if (!refreshToken) return null;
 
     try {
-        const response = await axios.get(apiRefreshUrl, {
+        const response = await axios.get(API_REFRESH_URL, {
             headers: { Authorization: `Bearer ${refreshToken}` }
         });
-        return response.data?.data?.access_token || null;
+
+        if (response.data.data?.access_token) {
+            return response.data.data.access_token;
+        } else {
+            throw new Error("Access Token Not Found!");
+        }
     } catch (error) {
-        console.error("Token Refresh Failed:", error.response?.data || error.message);
+        console.error("❌ Token Refresh Failed!", error.response ? error.response.data : error.message);
         return null;
     }
-}
+};
 
-// API: Get Channel M3U8
-app.get("/channel/:id", async (req, res) => {
-    const channelId = req.params.id;
+// Extract chunks.m3u8 URL
+const extractChunksUrl = (m3u8Content, baseUrl) => {
+    const lines = m3u8Content.split("\n");
+    for (let line of lines) {
+        if (line.includes("chunks.m3u8")) {
+            return baseUrl + line.trim();
+        }
+    }
+    return null;
+};
+
+// Process TS segments
+const processChunks = (m3u8Content, baseUrl) => {
+    return m3u8Content
+        .split("\n")
+        .map(line => line.includes(".ts") ? baseUrl + line.trim() : line)
+        .join("\n");
+};
+
+// Express API Route
+app.get("/stream/:id", async (req, res) => {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "Channel ID Required!" });
+
     const accessToken = await getAccessToken();
-    if (!accessToken) return res.status(401).json({ error: "Unauthorized" });
+    if (!accessToken) return res.status(401).json({ error: "Unauthorized!" });
 
     try {
-        const channelResponse = await axios.get(`https://api.jadoodigital.com/api/v2.1/user/channel/${channelId}`, {
+        const response = await axios.get(`${API_CHANNEL_URL}${id}`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
 
-        if (!channelResponse.data?.url) return res.status(404).json({ error: "Channel URL not found" });
+        if (!response.data.url) {
+            return res.status(404).json({ error: "M3U8 URL Not Found!" });
+        }
 
-        const streamUrl = channelResponse.data.url;
-        const m3u8Response = await axios.get(streamUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+        const streamUrl = response.data.url;
+        const streamResponse = await axios.get(streamUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+        
+        const baseUrl = `https://edge01.iptv.digijadoo.net/live/${id}/`;
+        const chunksUrl = extractChunksUrl(streamResponse.data, baseUrl);
 
-        const baseUrl = `https://edge01.iptv.digijadoo.net/live/${channelId}/`;
-        const finalOutput = m3u8Response.data.replace(/chunks\.m3u8/g, `${baseUrl}chunks.m3u8`);
+        if (!chunksUrl) {
+            return res.status(500).json({ error: "Chunks.m3u8 Not Found!" });
+        }
+
+        const chunksResponse = await axios.get(chunksUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+        const finalOutput = processChunks(chunksResponse.data, baseUrl);
 
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.send(finalOutput);
+        res.status(200).send(finalOutput);
     } catch (error) {
-        res.status(500).json({ error: "Failed to fetch stream" });
+        console.error("❌ Stream Fetch Failed!", error.response ? error.response.data : error.message);
+        res.status(500).json({ error: "Failed to Fetch Stream!" });
     }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Start Server
+app.listen(PORT, () => {
+    console.log(`🚀 Server running at http://localhost:${PORT}`);
+});
