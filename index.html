@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jadoo TV Streaming</title>
+    <script src="https://cdn.jsdelivr.net/npm/clappr@latest/dist/clappr.min.js"></script>
+</head>
+<body>
+    <h2>Jadoo TV Streaming</h2>
+    <input type="text" id="channelId" placeholder="Enter Channel ID">
+    <button onclick="loadStream()">Play</button>
+    <div id="player"></div>
+
+    <script>
+        async function loadStream() {
+            const channelId = document.getElementById("channelId").value;
+            if (!channelId) {
+                alert("Please enter a channel ID.");
+                return;
+            }
+
+            const response = await fetch(`/channel/${channelId}`);
+            if (!response.ok) {
+                alert("Failed to load stream.");
+                return;
+            }
+
+            const streamUrl = URL.createObjectURL(await response.blob());
+            const player = new Clappr.Player({
+                source: streamUrl,
+                parentId: "#player",
+                autoPlay: true
+            });
+        }
+    </script>
+</body>
+</html>
